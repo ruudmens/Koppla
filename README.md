@@ -1,6 +1,6 @@
 # Koppla
 
-Koppla is a **model-context-protocol server** for **Active Directory** that enables you to manage users, groups, and policies using natural language.
+Koppla is a **model-context-protocol server** for **Active Directory** that enables you to manage users, groups, and computer objects using natural language.
 
 <img src="https://github.com/ruudmens/Koppla/blob/main/assets/Koppla-demo.gif?raw=true" alt="Koppla Demo" width="500"/>
 
