@@ -1,0 +1,4 @@
+ldap3
+mcp
+python-dotenv
+cryptography

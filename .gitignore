@@ -1,0 +1,25 @@
+__pycache__/
+*.log
+.env
+build
+dist
+koppla.egg-info
+
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Encryption keys that might be generated during testing
+.koppla_key
