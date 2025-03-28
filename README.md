@@ -2,6 +2,9 @@
 
 Koppla is a **model-context-protocol server** for **Active Directory** that enables you to manage users, groups, and policies using natural language.
 
+<img src="https://github.com/ruudmens/Koppla/blob/main/assets/Koppla-demo.gif?raw=true" alt="Koppla Demo" width="500"/>
+
+
 With Koppla, you can seamlessly query and manage your Active Directory environment using Claude Desktop or other MCP capable AI agents.
 ---
 
