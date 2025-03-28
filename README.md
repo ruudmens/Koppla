@@ -4,6 +4,7 @@ Koppla is a **model-context-protocol server** for **Active Directory** that enab
 
 <img src="https://github.com/ruudmens/Koppla/blob/main/assets/Koppla-demo.gif?raw=true" alt="Koppla Demo" width="500"/>
 
+For more information, visit [https://lazyadmin.nl/koppla](https://lazyadmin.nl/koppla)
 
 With Koppla, you can seamlessly query and manage your Active Directory environment using Claude Desktop or other MCP capable AI agents.
 ---
