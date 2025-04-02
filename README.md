@@ -91,6 +91,9 @@ To manually configure Koppla with the Claude Desktop app, add the following conf
 }
 ```
 
+## ⚠️ Data Processing & Privacy Notice
+Important: Koppla transmits Active Directory data to external AI models for processing. This may have security and compliance implications, particularly for organizations subject to GDPR or similar regulations. No AD data is stored by Koppla itself, but be aware that AI agents may retain conversation history according to their own policies. Ensure usage complies with your organization's data handling requirements and consider limiting the scope of queryable data through careful configuration.
+
 ## 🔒 Security Features
 
 ### Password Encryption
