@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="koppla",
-    version="0.16",
+    version="0.17",
     packages=find_packages(),
     install_requires=[
         "ldap3",

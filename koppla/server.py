@@ -1,41 +1,66 @@
+"""
+Koppla MCP Server for Active Directory and GPO Management
+"""
 from ldap3 import Server, Connection, ALL, SUBTREE, MODIFY_REPLACE, MODIFY_ADD, MODIFY_DELETE
 from mcp.server.fastmcp import FastMCP
 import os
+import sys
 from datetime import datetime, timedelta
 import re
 import json
 from pathlib import Path
-import platform
 from cryptography.fernet import Fernet
+from .rsat_checker import check_gpo_tools_installed
+from .gpo_handler import GPOHandler, is_windows
+from .encryption_utils import decrypt_password, get_config_path
+import anyio
+import time
+import traceback
 
 # Initialize FastMCP server
-mcp = FastMCP("active_directory")
+try:
+    print("Starting MCP server initialization", file=sys.stderr)
+    mcp = FastMCP("active_directory")
+    print("FastMCP initialized", file=sys.stderr)
+except Exception as e:
+    print(f"Failed to initialize FastMCP: {str(e)}", file=sys.stderr)
+    import traceback
+    traceback.print_exc(file=sys.stderr)
+    sys.exit(1)
+
+# Initialize the GPO handler if running on Windows
+gpo_handler = None
+GPO_ENABLED = is_windows() and os.getenv("GPO_ENABLED", "false").lower() == "true"
+
+# Validate RSAT for GPO functionality
+if GPO_ENABLED:
+    print("Checking RSAT for GPO functionality", file=sys.stderr)
+    if not check_gpo_tools_installed():
+        print("⚠️ WARNING: GPO_ENABLED is set but RSAT tools not detected.", file=sys.stderr)
+        print("GPO functionality will be disabled.", file=sys.stderr)
+        GPO_ENABLED = False
 
 # Load configuration from environment variables
 AD_SERVER = os.getenv("AD_SERVER")
 AD_USER = os.getenv("AD_USER")
 AD_PASSWORD = os.getenv("AD_PASSWORD")
 BASE_DN = os.getenv("BASE_DN")
-AD_WRITE_ENABLED = os.getenv("AD_WRITE_ENABLED", "false").lower() == "true" 
-
-# Define the AD server
-server = Server(AD_SERVER, get_info=ALL)
+AD_WRITE_ENABLED = os.getenv("AD_WRITE_ENABLED", "false").lower() == "true"
 
 # Define protected accounts that should never be modified
 PROTECTED_ACCOUNTS = [
-    "administrator", "admin", "krbtgt", "guest", 
-    "domain controller", "cert publisher", "dns", 
+    "administrator", "admin", "krbtgt", "guest",
+    "domain controller", "cert publisher", "dns",
     "domain admins", "schema admins", "enterprise admins",
     "group policy creator owners", "nt authority", "system",
     "backup", "service", "iis_iusrs", "network service",
     "local service", "everyone", "authenticated users",
-    # Add any other sensitive accounts specific to your organization
     "backup_admin", "service_account", "sql_service", "exchange_service"
 ]
 
-# Pattern for service accounts - typically includes $ or follows naming conventions
+# Pattern for service accounts
 SERVICE_ACCOUNT_PATTERNS = [
-    r".*\$$",  # Accounts ending with $ (machine accounts)
+    r".*\$$",  # Accounts ending with $
     r"svc_.*",  # Accounts starting with svc_
     r"service_.*",  # Accounts starting with service_
     r"sa_.*",  # Accounts starting with sa_
@@ -43,69 +68,9 @@ SERVICE_ACCOUNT_PATTERNS = [
     r"sys_.*",  # Accounts starting with sys_
 ]
 
-def get_config_path():
-    """Get the path to the Claude Desktop configuration file based on OS"""
-    if platform.system() == "Windows":
-        # Try getting from environment variable first
-        appdata_roaming = os.environ.get('APPDATA')
-        
-        # If not available, construct the typical Windows path
-        if not appdata_roaming:
-            # Try to get the username
-            username = os.environ.get('USERNAME') or os.environ.get('USER')
-            if username:
-                appdata_roaming = f"C:\\Users\\{username}\\AppData\\Roaming"
-        
-        return os.path.join(appdata_roaming, "Claude", "claude_desktop_config.json")
-    elif platform.system() == "Darwin":  # macOS
-        home = str(Path.home())
-        return os.path.join(home, "Library", "Application Support", "Claude", "claude_desktop_config.json")
-    else:  # Linux
-        home = str(Path.home())
-        return os.path.join(home, ".config", "Claude", "claude_desktop_config.json")
-
-def get_key_path():
-    """Get the path to the encryption key file"""
-    config_dir = os.path.dirname(get_config_path())
-    return os.path.join(config_dir, ".koppla_key")
-
-def load_encryption_key():
-    """Load the encryption key for decrypting credentials"""
-    key_path = get_key_path()
-    try:
-        if os.path.exists(key_path):
-            with open(key_path, 'rb') as key_file:
-                key = key_file.read()
-            return key
-        else:
-            print(f"Warning: Encryption key not found at {key_path}")
-            return None
-    except Exception as e:
-        print(f"Error loading encryption key: {str(e)}")
-        return None
-
-def decrypt_password(encrypted_value):
-    """Decrypt a password that was encrypted with Fernet"""
-    if not encrypted_value or not encrypted_value.startswith("ENCRYPTED:"):
-        return encrypted_value
-        
-    try:
-        encryption_key = load_encryption_key()
-        if not encryption_key:
-            print("Warning: Could not load encryption key, using encrypted password as-is")
-            return encrypted_value
-            
-        fernet = Fernet(encryption_key)
-        encrypted_data = encrypted_value[10:].encode()  # Remove "ENCRYPTED:" prefix
-        decrypted_password = fernet.decrypt(encrypted_data).decode()
-        return decrypted_password
-    except Exception as e:
-        print(f"Error decrypting password: {str(e)}")
-        return encrypted_value  # Return the encrypted value if decryption fails
-
 def load_config():
     """Load credentials from Claude Desktop config or environment variables"""
-    # Try loading from Claude config first
+    print("Loading configuration", file=sys.stderr)
     config_path = get_config_path()
     
     if os.path.exists(config_path):
@@ -113,13 +78,11 @@ def load_config():
             with open(config_path, 'r') as f:
                 config = json.load(f)
             
-            # Look for Active Directory MCP configuration
             for server_name, server_config in config.get("mcpServers", {}).items():
                 env = server_config.get("env", {})
                 if "AD_SERVER" in env:
-                    print(f"Found AD configuration in server: {server_name}")
+                    print(f"Found AD configuration in server: {server_name}", file=sys.stderr)
                     
-                    # Get password and decrypt if necessary
                     encrypted_password = env.get("AD_PASSWORD")
                     decrypted_password = decrypt_password(encrypted_password)
                     
@@ -131,37 +94,36 @@ def load_config():
                         "AD_WRITE_ENABLED": env.get("AD_WRITE_ENABLED", "false").lower() == "true"
                     }
         except Exception as e:
-            print(f"Error loading Claude configuration: {str(e)}")
+            print(f"Error loading Claude configuration: {str(e)}", file=sys.stderr)
     
-    # Fall back to environment variables
-    print("Using environment variables for configuration")
+    print("Using environment variables for configuration", file=sys.stderr)
+    decrypted_password = decrypt_password(os.getenv("AD_PASSWORD"))
     return {
         "AD_SERVER": os.getenv("AD_SERVER"),
         "AD_USER": os.getenv("AD_USER"),
-        "AD_PASSWORD": os.getenv("AD_PASSWORD"),
+        "AD_PASSWORD": decrypted_password,
         "BASE_DN": os.getenv("BASE_DN"),
         "AD_WRITE_ENABLED": os.getenv("AD_WRITE_ENABLED", "false").lower() == "true"
     }
 
 def create_ldap_connection():
     """Create an LDAP connection using current configuration"""
-    # Load config at call time
+    print("Creating LDAP connection", file=sys.stderr)
     config = load_config()
     
-    # Extract configuration values
     ad_server = config.get("AD_SERVER")
     ad_user = config.get("AD_USER")
     ad_password = config.get("AD_PASSWORD")
     
     if not ad_server:
+        print("AD server not configured", file=sys.stderr)
         raise ValueError("AD server not configured. Run koppla-config configure first.")
     
     try:
-        # Create server instance
         server = Server(ad_server, get_info=ALL)
         
         if ad_user and ad_password:
-            print(f"Connecting to {ad_server} with user {ad_user}")
+            print(f"Connecting to {ad_server} with user {ad_user}", file=sys.stderr)
             conn = Connection(
                 server,
                 user=ad_user,
@@ -170,45 +132,49 @@ def create_ldap_connection():
             )
             return conn
         else:
+            print("Missing AD credentials", file=sys.stderr)
             raise ValueError("Missing AD credentials")
     except Exception as e:
-        print(f"Failed to connect to AD: {str(e)}")
+        print(f"Failed to connect to AD: {str(e)}", file=sys.stderr)
         raise
 
 def is_protected_account(username):
     """Check if an account should be protected from modifications."""
-    # Convert to lowercase for case-insensitive comparison
     username_lower = username.lower()
     
-    # Check direct matches against protected accounts list
     if username_lower in [name.lower() for name in PROTECTED_ACCOUNTS]:
-        print(f"Attempted to modify protected account: {username}")
+        print(f"Attempted to modify protected account: {username}", file=sys.stderr)
         return True
         
-    # Check pattern matches for service accounts
     for pattern in SERVICE_ACCOUNT_PATTERNS:
         if re.match(pattern, username_lower):
-            print(f"Attempted to modify service account: {username}")
+            print(f"Attempted to modify service account: {username}", file=sys.stderr)
             return True
             
     return False
-    
-# Validate configuration
-required_vars = {"AD_SERVER": AD_SERVER, "BASE_DN": BASE_DN}
-missing_vars = [key for key, value in required_vars.items() if not value]
 
-if missing_vars:
-    raise ValueError(f"Missing required environment variables: {', '.join(missing_vars)}")
+# Validate configuration
+try:
+    required_vars = {"AD_SERVER": AD_SERVER, "BASE_DN": BASE_DN}
+    missing_vars = [key for key, value in required_vars.items() if not value]
+    if missing_vars:
+        print(f"Missing required environment variables: {', '.join(missing_vars)}", file=sys.stderr)
+        raise ValueError(f"Missing required environment variables: {', '.join(missing_vars)}")
+except Exception as e:
+    print(f"Configuration validation failed: {str(e)}", file=sys.stderr)
+    import traceback
+    traceback.print_exc(file=sys.stderr)
+    sys.exit(1)
 
 def timestamp_to_datetime(timestamp):
-    """Convert Windows FILETIME (100-nanosecond intervals since 1601) or datetime to datetime."""
-    if not timestamp: 
+    """Convert Windows FILETIME to datetime."""
+    if not timestamp:
         return None
-    if isinstance(timestamp, int):  
+    if isinstance(timestamp, int):
         if timestamp > 0:
             return datetime(1601, 1, 1) + timedelta(microseconds=timestamp / 10)
         return None
-    elif isinstance(timestamp, datetime): 
+    elif isinstance(timestamp, datetime):
         return timestamp
     return None
 
@@ -218,50 +184,17 @@ def query_ad(query_type: str, params: dict = None) -> dict:
     Query or update Active Directory with flexible parameters.
     
     Args:
-        query_type: One of "search_ldap", "search_users", "update_user", "add_to_group", "remove_from_group""
-        params: Dictionary of parameters specific to the query_type:
-                - "search_ldap": {"search_base": str (optional), "search_filter": str, "attributes": list (optional)}
-                    - Perform a direct LDAP search with a custom filter (read-only operation)
-                
-                - "search_users": {"search_term": str, "department": str (optional), "exact": bool (optional)}
-                    - Search for users by name, username, or email with flexible matching
-                                    
-                - "update_user": {"username": str, "field": str, "value": str}
-                    - Update a user attribute (requires AD_WRITE_ENABLED=true)
-                    - IMPORTANT: "confirmed" must only be set to True after explicit human approval
-                    
-                - "add_to_group": {"username": str (exact sAMAccountName or name to resolve), "group_name": str}
-                    - Add user to a group ((requires AD_WRITE_ENABLED=true). Resolves names to usernames if unique.
-                    - IMPORTANT: "confirmed" must only be set to True after explicit human approval
-
-                - "remove_from_group": {"username": str, "group_name": str}
-                    - Remove a user from a group (requires AD_WRITE_ENABLED=true)
-                    - IMPORTANT: "confirmed" must only be set to True after explicit human approval
-
-                - "inactive_users": {"days": int (default 30)}
-                    - Find users inactive for X days.
-    
-    Returns:
-        A dictionary with "status" and "data" or "message" fields
-
-    Usage Note for Claude:
-        When you receive a response with "status": "confirmation_required", you MUST:
-        1. Present the pending changes to the human user
-        2. Ask explicitly if they want to proceed
-        3. Only set confirmed=True if the human explicitly agrees
-        NEVER set confirmed=True automatically without human approval
+        query_type: One of "search_ldap", "search_users", "update_user", "add_to_group", "remove_from_group"
+        params: Dictionary of parameters specific to the query_type
     """
     if params is None:
         params = {}
         
-    # Simple command logging 
-    print(f"Executing query_type: {query_type}, params: {str({k: v for k, v in params.items() if k != 'confirmed'})}")
+    print(f"Executing AD query_type: {query_type}, params: {str({k: v for k, v in params.items() if k != 'confirmed'})}", file=sys.stderr)
     
     try:
-        # Create the connection
         conn = create_ldap_connection()
         
-        # Handle different query types
         if query_type == "search_ldap":
             search_base = params.get("search_base", BASE_DN)
             search_filter = params.get("search_filter")
@@ -272,23 +205,17 @@ def query_ad(query_type: str, params: dict = None) -> dict:
                 
             conn.search(search_base, search_filter, SUBTREE, attributes=attributes)
             
-            # Process results
             results = []
             for entry in conn.entries:
                 entry_data = {}
                 for attr in entry.entry_attributes:
-                    # Handle multi-valued attributes
                     if len(entry[attr].values) > 1:
                         entry_data[attr] = entry[attr].values
-                    # Handle date/time attributes
                     elif attr.lower() in ['lastlogon', 'lastlogontimestamp', 'pwdlastset', 'badpasswordtime', 'lockouttime']:
                         timestamp = entry[attr].value
                         entry_data[attr] = str(timestamp_to_datetime(timestamp)) if timestamp else None
-                    # Handle normal single-valued attributes
                     else:
                         entry_data[attr] = entry[attr].value
-                
-                # Add the DN
                 entry_data['dn'] = entry.entry_dn
                 results.append(entry_data)
                 
@@ -305,14 +232,12 @@ def query_ad(query_type: str, params: dict = None) -> dict:
             if search_term == "*" and not department:
                 return {"status": "error", "message": "Wildcard '*' alone is not allowed; specify a department or more specific term"}
                 
-            # Building the search filter
             filter_parts = ['(objectClass=user)', '(!(objectClass=computer))']
             
             if search_term:
                 if exact:
-                    filter_parts.append(f'(sAMAccountName={search_term})') 
+                    filter_parts.append(f'(sAMAccountName={search_term})')
                 else:
-                    # Search across multiple user attributes
                     filter_parts.append(
                         f'(|(cn=*{search_term}*)'
                         f'(sAMAccountName=*{search_term}*)'
@@ -324,10 +249,10 @@ def query_ad(query_type: str, params: dict = None) -> dict:
                 filter_parts.append(f'(department={department})')
                 
             search_filter = f'(&{"".join(filter_parts)})'
-            print(f"User search filter: {search_filter}")
+            print(f"User search filter: {search_filter}", file=sys.stderr)
             
-            conn.search(BASE_DN, search_filter, SUBTREE, 
-                        attributes=['cn', 'mail', 'sAMAccountName', 'givenName', 
+            conn.search(BASE_DN, search_filter, SUBTREE,
+                        attributes=['cn', 'mail', 'sAMAccountName', 'givenName',
                                    'displayName', 'department', 'title', 'lastLogon'])
             
             results = []
@@ -335,7 +260,7 @@ def query_ad(query_type: str, params: dict = None) -> dict:
                 try:
                     sam_account = entry.sAMAccountName.value
                     if sam_account and sam_account.endswith('$'):
-                        print(f"Skipping computer account: {sam_account}")
+                        print(f"Skipping computer account: {sam_account}", file=sys.stderr)
                         continue
                         
                     last_logon = timestamp_to_datetime(entry.lastLogon.value) if entry.lastLogon else None
@@ -354,7 +279,7 @@ def query_ad(query_type: str, params: dict = None) -> dict:
                     
                     results.append(result)
                 except Exception as e:
-                    print(f"Skipping entry due to error: {str(e)} for DN: {entry.entry_dn}")
+                    print(f"Skipping entry due to error: {str(e)} for DN: {entry.entry_dn}", file=sys.stderr)
                     
             if not results:
                 return {"status": "success", "data": [], "message": "No matching users found"}
@@ -363,7 +288,7 @@ def query_ad(query_type: str, params: dict = None) -> dict:
                 note = f"For actions like adding to groups, use the 'username' field: '{results[0]['username']}'."
                 return {"status": "success", "data": results[0], "note": note}
                 
-            return {"status": "success", "data": results, 
+            return {"status": "success", "data": results,
                     "message": "For actions like adding to groups, use the 'username' field (e.g., 'tsmith')."}
             
         elif query_type == "update_user":
@@ -378,40 +303,36 @@ def query_ad(query_type: str, params: dict = None) -> dict:
             if not all([username, field, value]):
                 return {"status": "error", "message": "Username, field, and value are all required"}
             
-            # Check if this is a protected account
             if is_protected_account(username):
-                print(f"Blocked attempt to modify protected account: {username}")
+                print(f"Blocked attempt to modify protected account: {username}", file=sys.stderr)
                 return {
-                    "status": "error", 
+                    "status": "error",
                     "message": f"Account '{username}' is protected and cannot be modified for security reasons."
                 }
             
-            # Block any password-related operations
             password_related_fields = [
-                "unicodepwd", "userpassword", "password", "pwdlastset", 
+                "unicodepwd", "userpassword", "password", "pwdlastset",
                 "useraccountcontrol", "lockouttime", "accountexpires"
             ]
             
             if field.lower() in password_related_fields:
-                print(f"Blocked attempt to modify password-related field: {username}.{field}")
+                print(f"Blocked attempt to modify password-related field: {username}.{field}", file=sys.stderr)
                 return {
                     "status": "error",
                     "message": f"Password reset or modification is not supported through this interface for security reasons."
                 }
             
-            # Protected attributes that shouldn't be modified
             protected_attributes = [
-                "objectGUID", "objectSid", "distinguishedName", "cn", "name", 
+                "objectGUID", "objectSid", "distinguishedName", "cn", "name",
                 "sAMAccountName", "userAccountControl", "memberOf", "member"
             ]
             
             if field.lower() in [p.lower() for p in protected_attributes]:
                 return {
-                    "status": "error", 
+                    "status": "error",
                     "message": f"Modification of attribute '{field}' is not allowed for security reasons"
                 }
                 
-            # Find the user
             search_filter = f'(&(objectClass=user)(sAMAccountName={username}))'
             conn.search(BASE_DN, search_filter, SUBTREE, attributes=['primaryGroupID', 'memberOf'])
             
@@ -420,31 +341,27 @@ def query_ad(query_type: str, params: dict = None) -> dict:
                 
             user_dn = conn.entries[0].entry_dn
             
-            # Additional security check - prevent modifications to users in administrative groups
             if conn.entries[0].memberOf:
                 admin_group_patterns = ['CN=Domain Admins', 'CN=Enterprise Admins', 'CN=Schema Admins', 'CN=Administrators']
                 for group_dn in conn.entries[0].memberOf.values:
                     if any(pattern.lower() in group_dn.lower() for pattern in admin_group_patterns):
-                        print(f"Blocked attempt to modify administrative account: {username}")
+                        print(f"Blocked attempt to modify administrative account: {username}", file=sys.stderr)
                         return {
-                            "status": "error", 
+                            "status": "error",
                             "message": f"Account '{username}' is a member of administrative groups and cannot be modified for security reasons."
                         }
             
-            # If not confirmed, return what would be changed
             if not confirmed:
                 return {
                     "status": "confirmation_required",
-                    "message": f"Confirm: Set {field}='{value}' for user '{username}'? To proceed, reply with 'Yes'.",
+                    "message": f"Confirm: Set {field}='{value}' for user '{username}'? To proceed, reply 'Yes'.",
                     "note_for_claude": "You must ask the human user if they want to proceed with this change. Only set confirmed=True if they explicitly agree.",
                     "user": username,
                     "changes": {field: value}
                 }
                 
-            # Log the modification
-            print(f"Updating user attribute: {username}.{field} = '{value}'")
+            print(f"Updating user attribute: {username}.{field} = '{value}'", file=sys.stderr)
             
-            # Perform the modification
             conn.modify(user_dn, {field: [(MODIFY_REPLACE, [value])]})
             
             if conn.result['result'] == 0:
@@ -463,40 +380,36 @@ def query_ad(query_type: str, params: dict = None) -> dict:
             if not all([username, group_name]):
                 return {"status": "error", "message": "Username and group_name are required"}
                 
-            # Check if this is a protected account
             if is_protected_account(username):
-                print(f"Blocked attempt to modify protected account: {username}")
+                print(f"Blocked attempt to modify protected account: {username}", file=sys.stderr)
                 return {
-                    "status": "error", 
+                    "status": "error",
                     "message": f"Account '{username}' is protected and cannot be modified for security reasons."
                 }
                 
-            # Check if the group is a protected administrative group
             admin_groups = ["domain admins", "enterprise admins", "schema admins", "administrators", "backup operators", "account operators"]
             if group_name.lower() in admin_groups:
-                print(f"Blocked attempt to add user to administrative group: {username} -> {group_name}")
+                print(f"Blocked attempt to add user to administrative group: {username} -> {group_name}", file=sys.stderr)
                 return {
-                    "status": "error", 
+                    "status": "error",
                     "message": f"Group '{group_name}' is a protected administrative group. Adding users is restricted."
                 }
                 
-            # Search for user and group
             user_filter = f'(&(objectClass=user)(sAMAccountName={username}))'
             group_filter = f'(&(objectClass=group)(cn={group_name}))'
             
             conn.search(BASE_DN, user_filter, SUBTREE)
             if not conn.entries:
-                print(f"User '{username}' not found")
+                print(f"User '{username}' not found", file=sys.stderr)
                 return {"status": "error", "message": f"User '{username}' not found"}
             user_dn = conn.entries[0].entry_dn
             
             conn.search(BASE_DN, group_filter, SUBTREE)
             if not conn.entries:
-                print(f"Group '{group_name}' not found")
+                print(f"Group '{group_name}' not found", file=sys.stderr)
                 return {"status": "error", "message": f"Group '{group_name}' not found"}
             group_dn = conn.entries[0].entry_dn
             
-            # Confirmation step
             if not confirmed:
                 note = f"If the answers is Yes or yes, then add confirmed: True, in the next request to add the user to the group'."
                 return {
@@ -507,14 +420,11 @@ def query_ad(query_type: str, params: dict = None) -> dict:
                     "group": group_name
                 }
                 
-           # Perform the modification
             conn.modify(group_dn, {'member': [(MODIFY_ADD, [user_dn])]})
             result_code = conn.result['result']
-            print(f"Add to group result: {conn.result}")
+            print(f"Add to group result: {conn.result}", file=sys.stderr)
             
-            # Check result: 0 = success, 68 = already exists (still a success)
             if result_code == 0 or result_code == 68:
-                # Verify group members
                 conn.search(BASE_DN, group_filter, SUBTREE, attributes=['member'])
                 if conn.entries:
                     members = conn.entries[0].member.values if conn.entries[0].member else []
@@ -536,7 +446,6 @@ def query_ad(query_type: str, params: dict = None) -> dict:
                     }
                 return {"status": "success", "data": f"User {username} added to {group_name}, but could not verify members."}
             
-            # If modification fails for another reason
             return {"status": "error", "data": f"Add to group failed: {conn.result['description']}"}
                 
         elif query_type == "remove_from_group":
@@ -550,24 +459,21 @@ def query_ad(query_type: str, params: dict = None) -> dict:
             if not all([username, group_name]):
                 return {"status": "error", "message": "Username and group_name are required"}
                 
-            # Check if this is a protected account
             if is_protected_account(username):
-                print(f"Blocked attempt to modify protected account: {username}")
+                print(f"Blocked attempt to modify protected account: {username}", file=sys.stderr)
                 return {
-                    "status": "error", 
+                    "status": "error",
                     "message": f"Account '{username}' is protected and cannot be modified for security reasons."
                 }
                 
-            # Check if attempting to remove a user from a critical system group
             critical_system_groups = ["Domain Users"]
             if group_name.lower() in [g.lower() for g in critical_system_groups]:
-                print(f"Blocked attempt to remove user from critical system group: {username} -> {group_name}")
+                print(f"Blocked attempt to remove user from critical system group: {username} -> {group_name}", file=sys.stderr)
                 return {
-                    "status": "error", 
+                    "status": "error",
                     "message": f"Group '{group_name}' is a critical system group. Removing users is restricted."
                 }
                 
-            # Search for user and group
             user_filter = f'(&(objectClass=user)(sAMAccountName={username}))'
             group_filter = f'(&(objectClass=group)(cn={group_name}))'
             
@@ -581,12 +487,10 @@ def query_ad(query_type: str, params: dict = None) -> dict:
                 return {"status": "error", "message": f"Group '{group_name}' not found"}
             group_dn = conn.entries[0].entry_dn
             
-            # Check if user is actually a member of the group
             conn.search(BASE_DN, group_filter, SUBTREE, attributes=['member'])
             if not conn.entries or not conn.entries[0].member or user_dn not in conn.entries[0].member.values:
                 return {"status": "error", "message": f"User '{username}' is not a member of group '{group_name}'"}
             
-            # If not confirmed, return what would be changed
             if not confirmed:
                 return {
                     "status": "confirmation_required",
@@ -596,15 +500,12 @@ def query_ad(query_type: str, params: dict = None) -> dict:
                     "group": group_name
                 }
                 
-            # Log the modification
-            print(f"Removing user from group: {username} -> {group_name}")
+            print(f"Removing user from group: {username} -> {group_name}", file=sys.stderr)
             
-            # Perform the modification
             conn.modify(group_dn, {'member': [(MODIFY_DELETE, [user_dn])]})
             
             if conn.result['result'] == 0:
-                # Get the updated group members
-                conn.search(BASE_DN, group_filter, SUBTREE, attributes=['member'])
+                conn.search(BASE_DN, group_filter,SUBTREE, attributes=['member'])
                 
                 if conn.entries:
                     members = conn.entries[0].member.values if conn.entries[0].member else []
@@ -627,7 +528,6 @@ def query_ad(query_type: str, params: dict = None) -> dict:
                 
                 return {"status": "success", "message": f"User {username} removed from {group_name} successfully"}
             
-            # If modification fails
             return {"status": "error", "message": f"Remove from group failed: {conn.result['description']}"}
             
         elif query_type == "inactive_users":
@@ -639,7 +539,7 @@ def query_ad(query_type: str, params: dict = None) -> dict:
                 f'(lastLogonTimestamp<={cutoff_timestamp})'
                 f'(!(userAccountControl:1.2.840.113556.1.4.803:=2)))'
             )
-            conn.search(BASE_DN, search_filter, SUBTREE, 
+            conn.search(BASE_DN, search_filter, SUBTREE,
                         attributes=['displayName', 'sAMAccountName', 'department', 'lastLogonTimestamp'])
             results = [
                 {
@@ -653,17 +553,139 @@ def query_ad(query_type: str, params: dict = None) -> dict:
             return {"status": "success", "data": results if results else []}
             
         else:
+            print(f"Unknown AD query type: {query_type}", file=sys.stderr)
             return {"status": "error", "message": f"Unknown query_type: {query_type}"}
             
     except Exception as e:
-        print(f"Error executing {query_type}: {str(e)}")
+        print(f"Error executing AD query {query_type}: {str(e)}", file=sys.stderr)
         return {"status": "error", "message": str(e)}
         
     finally:
-        # Always unbind the connection
         if 'conn' in locals() and conn:
             conn.unbind()
 
+@mcp.tool(
+    name="query_gpo",
+    description="""
+Query Active Directory Group Policy Objects (GPOs) with various operations.
+
+Parameters:
+- query_type (str): The type of GPO query to perform. Supported values:
+  - list_gpos: List all GPOs in the domain (params: {}).
+  - get_gpo: Get details of a specific GPO (params: {"name": str} or {"id": str}).
+  - get_gpo_links: Get OU links for a GPO (params: {"name": str} or {"id": str}).
+  - get_gpo_report: Generate an XML report for a GPO (params: {"name": str} or {"id": str}; always returns Xml).
+  - find_gpos_with_setting: Find GPOs with a specific setting (params: {"setting": str, "value": str}).
+  - get_gpos_for_user: Get GPOs applied to a user (params: {"username": str}).
+  - get_all_gpo_links: Get all GPO links in the domain (params: {}).
+- params (dict, optional): Parameters for the query, as described above. Defaults to {}.
+
+Returns:
+- dict: Response with:
+  - status (str): "success" or "error".
+  - message (str, optional): Error details if status is "error".
+  - data (any, optional): Query results (e.g., list of GPOs, XML report string).
+  - format (str, optional): For get_gpo_report, always "Xml".
+
+Concurrency:
+- The server supports up to 2 concurrent get_gpo_report queries, which may take seconds to minutes for large GPOs.
+- Send multiple get_gpo_report queries with unique JSON-RPC "id" fields to run them in parallel.
+- Example:
+  [
+    {"method": "tools/call", "params": {"name": "query_gpo", "arguments": {"query_type": "get_gpo_report", "params": {"name": "GPO1"}}}, "jsonrpc": "2.0", "id": 1},
+    {"method": "tools/call", "params": {"name": "query_gpo", "arguments": {"query_type": "get_gpo_report", "params": {"name": "GPO2"}}}, "jsonrpc": "2.0", "id": 2}
+  ]
+- Responses include the matching "id" (e.g., {"jsonrpc": "2.0", "id": 1, "result": {...}}).
+- Set client timeout to at least 300 seconds, as responses may arrive out of order.
+
+Example Usage:
+- Single query: {"method": "tools/call", "params": {"name": "query_gpo", "arguments": {"query_type": "get_gpo_report", "params": {"name": "Default Domain Policy"}}}, "jsonrpc": "2.0", "id": 1}
+- Response: {"jsonrpc": "2.0", "id": 1, "result": {"content": [{"type": "text", "text": "{\"status\": \"success\", \"data\": \"<GPO>...</GPO>\", \"format\": \"Xml\"}"}], "isError": false}}
+"""
+)
+def query_gpo(query_type: str, params: dict = None) -> dict:
+    """
+    Query Group Policy Objects with flexible parameters.
+    
+    Args:
+        query_type: One of "list_gpos", "get_gpo", "get_gpo_links", "get_gpo_report",
+                   "find_gpos_with_setting", "get_gpos_for_user", "get_all_gpo_links"
+        params: Dictionary of parameters specific to the query_type
+    """
+    global gpo_handler
+    
+    if params is None:
+        params = {}
+        
+    print(f"Executing GPO query_type: {query_type}, params: {str(params)}", file=sys.stderr)
+    
+    if not GPO_ENABLED:
+        print("GPO query rejected: functionality disabled", file=sys.stderr)
+        return {
+            "status": "error",
+            "message": "GPO querying is disabled. Set GPO_ENABLED=true and ensure RSAT is installed."
+        }
+    
+    if not is_windows():
+        print("GPO query rejected: not Windows", file=sys.stderr)
+        return {
+            "status": "error",
+            "message": "GPO queries require Windows with PowerShell."
+        }
+    
+    try:
+        if gpo_handler is None:
+            print("Initializing GPO handler", file=sys.stderr)
+            config = load_config()
+            
+            credentials = {
+                "AD_USER": config.get("AD_USER"),
+                "AD_PASSWORD": config.get("AD_PASSWORD")
+            }
+            
+            if not credentials["AD_USER"] or not credentials["AD_PASSWORD"]:
+                print("Missing GPO credentials", file=sys.stderr)
+                return {"status": "error", "message": "GPO credentials not configured"}
+            
+            # Ensure password is decrypted
+            if credentials["AD_PASSWORD"].startswith("ENCRYPTED:"):
+                credentials["AD_PASSWORD"] = decrypt_password(credentials["AD_PASSWORD"])
+                if not credentials["AD_PASSWORD"]:
+                    print("Failed to decrypt GPO password", file=sys.stderr)
+                    return {"status": "error", "message": "Failed to decrypt GPO credentials"}
+            
+            domain = None
+            base_dn = config.get("BASE_DN")
+            if base_dn:
+                domain_parts = []
+                for part in base_dn.split(','):
+                    if part.strip().lower().startswith('dc='):
+                        domain_parts.append(part.strip()[3:])
+                if domain_parts:
+                    domain = '.'.join(domain_parts)
+            
+            gpo_handler = GPOHandler(credentials=credentials, domain=domain)
+            print("GPO handler initialized", file=sys.stderr)
+        
+        start_time = time.time()
+        result = gpo_handler.process_query(query_type, params)
+        elapsed = time.time() - start_time
+        if elapsed > 60:  # Warn for queries taking >60s
+            print(f"Warning: Query {query_type} took {elapsed:.1f}s", file=sys.stderr)
+        return result
+    
+    except anyio.BrokenResourceError:
+        print("Client disconnected during query processing", file=sys.stderr)
+        return {"status": "error", "message": "Client disconnected"}
+    except anyio.EndOfStream:
+        print("Stream closed during query processing", file=sys.stderr)
+        return {"status": "error", "message": "Stream closed"}
+    except Exception as e:
+        print(f"Error executing GPO query {query_type}: {str(e)}", file=sys.stderr)
+        traceback.print_exc(file=sys.stderr)
+        return {"status": "error", "message": str(e)}
+
 # Run the server
 if __name__ == "__main__":
+    print("Starting MCP server loop", file=sys.stderr)
     mcp.run()

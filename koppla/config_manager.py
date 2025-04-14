@@ -9,6 +9,7 @@ Usage:
     koppla-config configure
     koppla-config show
     koppla-config test
+    koppla-config check-rsat
 """
 
 import json
@@ -21,8 +22,35 @@ from pathlib import Path
 from ldap3 import Server, Connection, ALL, SUBTREE
 import platform
 from cryptography.fernet import Fernet
-import base64
-import hashlib
+
+# Import RSAT checker functions or define fallbacks
+try:
+    from .rsat_checker import is_windows, check_gpo_tools_installed, is_admin
+except ImportError:
+    # When running directly
+    sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+    try:
+        from rsat_checker import is_windows, check_gpo_tools_installed, is_admin
+    except ImportError:
+        # Define fallback functions if module not available
+        def is_windows():
+            return platform.system() == "Windows"
+        
+        def check_gpo_tools_installed():
+            return False
+            
+        def is_admin():
+            """Check if the script is running with administrative privileges."""
+            try:
+                if platform.system() == "Windows":
+                    import ctypes
+                    return ctypes.windll.shell32.IsUserAnAdmin() != 0
+                else:
+                    # On Unix-like systems, check if running as root (UID 0)
+                    return os.geteuid() == 0
+            except:
+                # If we can't check, assume not admin
+                return False
 
 # Key file location - adjacent to Claude config
 def get_key_path():
@@ -168,6 +196,35 @@ def configure_ad():
         print("Failed to encrypt password. Configuration aborted.")
         return
     
+    # Check if the user wants to enable GPO functionality (Windows only)
+    enable_gpo = False
+    if is_windows():
+        gpo_response = input("\nWould you like to enable Group Policy Object (GPO) functionality? (y/n): ").strip().lower()
+        if gpo_response == 'y':
+            # Check if RSAT tools are installed
+            if check_gpo_tools_installed():
+                print("✅ Group Policy Management tools are already installed.")
+                enable_gpo = True
+            else:
+                print("\n❌ Group Policy Management tools (RSAT) are not installed.")
+                print("GPO functionality requires Remote Server Administration Tools (RSAT).")
+                print("Please install RSAT manually. Visit https://lazyadmin.nl for instructions.")
+                print("After installing RSAT, run 'koppla-config check-rsat' to enable GPO functionality.")
+                print("GPO functionality will be disabled for now.")
+    else:
+        print("\nGroup Policy Object functionality is only available on Windows systems.")
+    
+    # Configure write operations
+    write_enabled_response = input("\nEnable write operations to Active Directory? (y/n): ").strip().lower()
+    write_enabled = write_enabled_response == 'y'
+    
+    if write_enabled:
+        print("\n⚠️ CAUTION: Write operations allow modifying Active Directory objects.")
+        print("This includes updating user attributes and modifying group memberships.")
+        print("It's recommended to keep this disabled until needed.")
+        confirm = input("Are you sure you want to enable write operations? (yes/no): ").strip().lower()
+        write_enabled = confirm == 'yes'
+    
     # Pre-defined MCP server name
     mcp_name = "Koppla-Active-Directory"
     
@@ -180,7 +237,8 @@ def configure_ad():
             "AD_USER": ad_user,
             "AD_PASSWORD": encrypted_password,  # Store the encrypted password
             "BASE_DN": base_dn,
-            "AD_WRITE_ENABLED": "false"  # Always start with write disabled for safety
+            "AD_WRITE_ENABLED": "true" if write_enabled else "false",
+            "GPO_ENABLED": "true" if enable_gpo else "false"
         }
     }
     
@@ -190,6 +248,15 @@ def configure_ad():
     # Save the configuration
     if save_config(config):
         print("\nConfiguration saved successfully with encrypted password!")
+        
+        # Display configuration summary
+        print("\n=== Configuration Summary ===")
+        print(f"AD Server: {ad_server}")
+        print(f"Base DN: {base_dn}")
+        print(f"AD User: {ad_user}")
+        print(f"Write Operations: {'Enabled' if write_enabled else 'Disabled'}")
+        print(f"GPO Functionality: {'Enabled' if enable_gpo else 'Disabled'}")
+        
         # Test with decrypted password
         test_ad_connection(ad_server, ad_user, ad_password, base_dn)
     else:
@@ -222,6 +289,14 @@ def show_config():
                 print(f"  AD Password: Not set")
                 
             print(f"  Write Enabled: {env.get('AD_WRITE_ENABLED', 'false')}")
+            print(f"  GPO Enabled: {env.get('GPO_ENABLED', 'false')}")
+            
+            # Check if GPO is enabled but RSAT tools are not installed
+            gpo_enabled = env.get('GPO_ENABLED', 'false').lower() == 'true'
+            if gpo_enabled and is_windows() and not check_gpo_tools_installed():
+                print("  ⚠️ Warning: GPO functionality is enabled but RSAT tools are not installed.")
+                print("  Run 'koppla-config check-rsat' to check RSAT status.")
+            
             print()
 
 def test_ad_connection(ad_server=None, ad_user=None, ad_password=None, base_dn=None):
@@ -291,6 +366,70 @@ def test_ad_connection(ad_server=None, ad_user=None, ad_password=None, base_dn=N
         print(f"Connection failed: {str(e)}")
         return False
 
+def check_rsat_status():
+    """Check RSAT status and enable GPO functionality if available"""
+    if not is_windows():
+        print("RSAT is only available on Windows systems.")
+        return
+    
+    # Check current configuration
+    config = load_config()
+    gpo_enabled = False
+    
+    # Find if GPO is enabled in config
+    for server_name, server_config in config.get("mcpServers", {}).items():
+        if server_name == "Koppla-Active-Directory" or "AD_SERVER" in server_config.get("env", {}):
+            env = server_config.get("env", {})
+            gpo_enabled = env.get("GPO_ENABLED", "false").lower() == "true"
+            break
+    
+    print("\n=== RSAT Group Policy Management Tools Check ===\n")
+    
+    # Check if RSAT GPO tools are installed
+    gpo_tools_installed = check_gpo_tools_installed()
+    
+    if gpo_tools_installed:
+        print("✅ Group Policy Management tools are installed.")
+        
+        # If tools are installed but GPO is disabled in config, ask if user wants to enable
+        if not gpo_enabled:
+            response = input("Group Policy functionality is currently disabled in your configuration. Enable it? (y/n): ").strip().lower()
+            if response == 'y':
+                # Update the configuration to enable GPO
+                for server_name, server_config in config.get("mcpServers", {}).items():
+                    if server_name == "Koppla-Active-Directory" or "AD_SERVER" in server_config.get("env", {}):
+                        server_config["env"]["GPO_ENABLED"] = "true"
+                        if save_config(config):
+                            print("GPO functionality has been enabled in your configuration.")
+                        else:
+                            print("Failed to update configuration.")
+                        break
+    else:
+        print("❌ Group Policy Management tools (RSAT) are not installed.")
+        
+        # If GPO is enabled in config but tools aren't installed, warn about this
+        if gpo_enabled:
+            print("⚠️ Warning: GPO functionality is enabled in your configuration but the required tools are not installed.")
+            print("This will cause GPO-related requests to fail.")
+            response = input("Would you like to disable GPO functionality until RSAT is installed? (y/n): ").strip().lower()
+            if response == 'y':
+                # Update the configuration to disable GPO
+                for server_name, server_config in config.get("mcpServers", {}).items():
+                    if server_name == "Koppla-Active-Directory" or "AD_SERVER" in server_config.get("env", {}):
+                        server_config["env"]["GPO_ENABLED"] = "false"
+                        if save_config(config):
+                            print("GPO functionality has been disabled in your configuration.")
+                        else:
+                            print("Failed to update configuration.")
+                        break
+        
+        # Provide instructions for manual installation
+        print("\nTo use GPO functionality, you need to install Remote Server Administration Tools (RSAT).")
+        print("Please follow these steps:")
+        print("1. Install RSAT with Group Policy Management tools manually")
+        print("2. For detailed instructions, visit: https://lazyadmin.nl")
+        print("3. After installation, run 'koppla-config check-rsat' again to enable GPO functionality")
+
 def main():
     """Main entry point for the CLI"""
     if len(sys.argv) < 2:
@@ -305,6 +444,8 @@ def main():
         show_config()
     elif command in ["test", "test_connection"]:
         test_ad_connection()
+    elif command in ["check-rsat", "rsat", "gpo"]:
+        check_rsat_status()
     else:
         print(f"Unknown command: {command}")
         print(__doc__)
