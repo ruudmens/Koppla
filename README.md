@@ -1,3 +1,5 @@
+[![MseeP.ai Security Assessment Badge](https://mseep.net/pr/ruudmens-koppla-badge.png)](https://mseep.ai/app/ruudmens-koppla)
+
 # Koppla
 
 Koppla is a **model-context-protocol server** for **Active Directory** that enables you to manage users, groups, and computer objects using natural language.
